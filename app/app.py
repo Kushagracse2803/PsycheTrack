@@ -3,22 +3,52 @@ import joblib
 import librosa
 import numpy as np
 import os
-from audiorecorder import audiorecorder
 import tempfile
+import cv2
+from PIL import Image
+import tensorflow as tf
 
 # -----------------------------
-# Load Models
+# 1. Dynamic Path Setup
 # -----------------------------
-# Text model & vectorizer
-nb_model = joblib.load("notebooks/models/naive_bayes_model.pkl")
-tfidf = joblib.load("notebooks/models/tfidf_vectorizer.pkl")
+current_dir = os.path.dirname(os.path.abspath(__file__))
+models_dir = os.path.join(current_dir, '..', 'models')
 
-# Audio model
-audio_model_path = "models/random_forest_audio_model.pkl"
+# -----------------------------
+# 2. Load Models
+# -----------------------------
+nb_model_path = os.path.join(models_dir, "naive_bayes_model.pkl")
+vectorizer_path = os.path.join(models_dir, "tfidf_vectorizer.pkl")
+audio_model_path = os.path.join(models_dir, "random_forest_audio_model.pkl")
+face_model_path = os.path.join(models_dir, "my_model.keras")
+
+# Load Text Models
+try:
+    nb_model = joblib.load(nb_model_path)
+    tfidf = joblib.load(vectorizer_path)
+except FileNotFoundError as e:
+    st.error(f"Critical Error: Text model file not found at {e.filename}. Please check your folders.")
+    st.stop()
+
+# Load Audio Model
 if os.path.exists(audio_model_path):
     rf_audio = joblib.load(audio_model_path)
 else:
     rf_audio = None
+
+# Load Face Model
+if os.path.exists(face_model_path):
+    try:
+        face_model = tf.keras.models.load_model(face_model_path)
+        print("Face model loaded successfully.")
+    except Exception as e:
+        st.error(f"Error loading face model: {e}")
+        face_model = None
+else:
+    face_model = None
+
+# Emotion Labels (Standard for FER-2013)
+EMOTIONS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
 # -----------------------------
 # Streamlit UI
@@ -26,12 +56,12 @@ else:
 st.set_page_config(page_title="🧠 Depression Detection", layout="wide")
 st.title("🧠 Multimodal Depression Detection App")
 st.write(
-    "This app can analyze **Text** 📝 or **Voice (Audio)** 🎙 to detect signs of depression.\n\n"
-    "It combines Natural Language Processing (for text) and Audio Signal Processing (for speech)."
+    "This app can analyze **Text** 📝, **Voice (Audio)** 🎙, and **Facial Expressions** 📸 "
+    "to detect signs of depression."
 )
 
-# Tabs for Text and Audio
-tab1, tab2 = st.tabs(["✍️ Text Detection", "🎤 Audio Detection"])
+# Tabs
+tab1, tab2, tab3 = st.tabs(["✍️ Text Detection", "🎤 Audio Detection", "📸 Face Detection"])
 
 # ---------------------------------------------------
 # TAB 1 — TEXT CLASSIFICATION
@@ -53,53 +83,107 @@ with tab1:
             st.warning("Please enter some text first.")
 
 # ---------------------------------------------------
-# TAB 2 — AUDIO CLASSIFICATION
+# TAB 2 — AUDIO CLASSIFICATION (FIXED)
 # ---------------------------------------------------
 with tab2:
     st.subheader("🎙 Audio-based Depression Detection")
 
     if rf_audio is None:
-        st.warning("⚠️ Audio model not found. Please train and save 'random_forest_audio_model.pkl' first.")
+        st.warning(f"⚠️ Audio model not found at: {audio_model_path}")
     else:
-        st.markdown("### 🔹 Option 1: Upload a `.wav` file")
-        uploaded_file = st.file_uploader("Upload a .wav file", type=["wav"])
+        # Use Native Streamlit Audio Input (Stable)
+        audio_buffer = st.audio_input("Record your voice")
+        uploaded_file = st.file_uploader("Or upload a .wav file", type=["wav"])
 
-        st.markdown("---")
-        st.markdown("### 🔹 Option 2: Record your voice using microphone")
-        audio = audiorecorder("🎙 Click to record", "Recording...")
+        # Select source
+        audio_source = audio_buffer if audio_buffer else uploaded_file
 
-        audio_data = None
+        if audio_source:
+            st.audio(audio_source)
+            
+            if st.button("Analyze Audio"):
+                try:
+                    # Write to temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+                        tmpfile.write(audio_source.getvalue())
+                        tmp_path = tmpfile.name
+                    
+                    # Preprocess
+                    y, sr = librosa.load(tmp_path, sr=16000)
+                    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+                    mfcc_mean = np.mean(mfcc, axis=1).reshape(1, -1)
+                    
+                    # Predict
+                    prediction_audio = rf_audio.predict(mfcc_mean)[0]
+                    
+                    st.markdown("### 🎯 **Prediction Result:**")
+                    if str(prediction_audio) in ["Depressed", "1"]:
+                        st.error("⚠️ The voice indicates **Depression**")
+                    else:
+                        st.success("✅ The voice indicates **Not Depressed**")
+                        
+                    # Clean up temp file
+                    os.unlink(tmp_path)
+                    
+                except Exception as e:
+                    st.error(f"Error processing audio: {e}")
 
-        # --- Option 1: Uploaded file ---
-        if uploaded_file is not None:
-            audio_data = uploaded_file
-            st.audio(uploaded_file)
-            st.info("Using uploaded audio file for prediction.")
+# ---------------------------------------------------
+# TAB 3 — FACE DETECTION
+# ---------------------------------------------------
+with tab3:
+    st.subheader("📸 Facial Expression Analysis")
+    st.write("Take a photo to analyze your emotional state.")
 
-        # --- Option 2: Recorded audio ---
-        elif len(audio) > 0:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
-                tmpfile.write(audio.tobytes())
-                audio_data = tmpfile.name
-            st.audio(audio.tobytes())
-            st.success("✅ Audio recorded successfully!")
+    if face_model is None:
+        st.warning(f"⚠️ Face model not found at: {face_model_path}. Please run your notebook to generate 'my_model.keras'.")
+    else:
+        img_file = st.camera_input("Take a snapshot")
 
-        # --- Prediction Section ---
-        if audio_data is not None:
-            try:
-                # Load and extract MFCCs
-                y, sr = librosa.load(audio_data, sr=16000)
-                mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-                mfcc_mean = np.mean(mfcc, axis=1).reshape(1, -1)
-
-                # Predict
-                prediction_audio = rf_audio.predict(mfcc_mean)[0]
-
-                st.markdown("### 🎯 **Prediction Result:**")
-                if prediction_audio == "Depressed":
-                    st.error("⚠️ The voice indicates **Depression**")
-                else:
-                    st.success("✅ The voice indicates **Not Depressed**")
-
-            except Exception as e:
-                st.error(f"Error processing audio: {e}")
+        if img_file is not None:
+            # 1. Load Image
+            image = Image.open(img_file)
+            img_array = np.array(image.convert('RGB'))
+            
+            # 2. Convert to Grayscale
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            
+            # 3. Detect Face
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+            
+            if len(faces) > 0:
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(img_array, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    
+                    # Crop and Resize
+                    roi_gray = gray[y:y+h, x:x+w]
+                    roi_gray = cv2.resize(roi_gray, (48, 48), interpolation=cv2.INTER_AREA)
+                    
+                    # Normalize and Reshape
+                    roi = roi_gray.astype('float') / 255.0
+                    roi = np.expand_dims(roi, axis=0)
+                    roi = np.expand_dims(roi, axis=-1)
+                    
+                    # Predict
+                    prediction = face_model.predict(roi)[0]
+                    max_index = int(np.argmax(prediction))
+                    predicted_emotion = EMOTIONS[max_index]
+                    confidence = prediction[max_index]
+                    
+                    # Display
+                    st.image(img_array, caption="Processed Image", width=350)
+                    st.markdown(f"### 🎯 **Detected Emotion:** `{predicted_emotion}`")
+                    st.progress(float(confidence))
+                    
+                    # Interpretation
+                    if predicted_emotion in ['Sad', 'Fear', 'Neutral']:
+                        st.warning(f"⚠️ Detected '{predicted_emotion}'. Persistent low affect can be a sign of depression.")
+                    elif predicted_emotion == 'Happy':
+                        st.success(f"✅ Detected '{predicted_emotion}'. Looks positive!")
+                    else:
+                        st.info(f"Detected '{predicted_emotion}'.")
+                    
+                    break
+            else:
+                st.warning("⚠️ No face detected. Please ensure your face is clearly visible.")
